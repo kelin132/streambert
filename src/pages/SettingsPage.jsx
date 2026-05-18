@@ -2030,7 +2030,7 @@ function SectionGroupHeader({ title, subtitle }) {
   );
 }
 
-// ── Section divider ───────────────────────────────────────────────────────────
+// ── Section divider ────────────────────────────────────────────────────��──────
 function Divider() {
   return (
     <div style={{ height: 1, background: "var(--border)", marginBottom: 40 }} />
@@ -3802,6 +3802,19 @@ export default function SettingsPage({
                 </div>
               </div>
             </div>
+          </div>
+
+          {/* Footer */}
+          <div
+            style={{
+              textAlign: "center",
+              padding: "24px 0 32px",
+              fontSize: 13,
+              color: "var(--text3)",
+              letterSpacing: 0.5,
+            }}
+          >
+            Made by KELIN
           </div>
         </div>
       </div>
