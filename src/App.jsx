@@ -10,15 +10,14 @@ import {
 import ErrorBoundary from "./components/ErrorBoundary";
 import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
 import WindowTitlebar from "./components/WindowTitlebar";
-import { storage, secureStorage, STORAGE_KEYS } from "./utils/storage";
+import { storage, STORAGE_KEYS } from "./utils/storage";
 import { applyAccentColor } from "./utils/appearance";
 import { collectBackupData } from "./utils/backup";
-import { tmdbFetch, setApiErrorHandlers } from "./utils/api";
+import { fetchLatestShows, fetchPopularShows } from "./utils/api";
 import { clearAppCaches } from "./utils/storage";
 
 import Sidebar from "./components/Sidebar";
 import SearchModal from "./components/SearchModal";
-import SetupScreen from "./components/SetupScreen";
 import CloseConfirmModal from "./components/CloseConfirmModal";
 import UpdateModal from "./components/UpdateModal";
 
@@ -32,11 +31,6 @@ const DownloadsPage = lazy(() => import("./pages/DownloadsPage"));
 import { checkForUpdates } from "./utils/updates";
 
 export default function App() {
-  // apiKey loaded async from secure storage (OS keychain)
-  const [apiKey, setApiKey] = useState(null);
-  const [apiKeyLoaded, setApiKeyLoaded] = useState(false);
-  const [skipped, setSkipped] = useState(false);
-  const [apiKeyStatus, setApiKeyStatus] = useState("checking"); // 'checking' | 'ok' | 'invalid_token' | 'unreachable'
   const [page, setPage] = useState(() => storage.get("startPage") || "home");
   const [selected, setSelected] = useState(null);
   const [showSearch, setShowSearch] = useState(false);
@@ -50,23 +44,54 @@ export default function App() {
   // Navigation history stack for Ctrl+Z back navigation
   const [navStack, setNavStack] = useState([]);
 
-  const [saved, setSaved] = useState(() => storage.get("saved") || {});
+  // Reset saved data for new API (uses URL-based identifiers now)
+  const [saved, setSaved] = useState(() => {
+    // Clear old TMDB-based saved data on first load
+    const existing = storage.get("saved");
+    if (existing && Object.keys(existing).some(k => k.match(/^(movie|tv)_\d+$/))) {
+      storage.set("saved", {});
+      storage.set("savedOrder", null);
+      return {};
+    }
+    return existing || {};
+  });
   // Separate order array for drag-and-drop reordering
   const [savedOrder, setSavedOrder] = useState(
     () => storage.get("savedOrder") || null,
   );
-  const [progress, setProgress] = useState(() => storage.get("progress") || {});
-  const [history, setHistory] = useState(() => storage.get("history") || []);
-  const [watched, setWatched] = useState(() => storage.get("watched") || {});
+  const [progress, setProgress] = useState(() => {
+    // Clear old TMDB-based progress data
+    const existing = storage.get("progress");
+    if (existing && Object.keys(existing).some(k => k.match(/^(movie|tv)_\d+/))) {
+      storage.set("progress", {});
+      return {};
+    }
+    return existing || {};
+  });
+  const [history, setHistory] = useState(() => {
+    // Clear old TMDB-based history
+    const existing = storage.get("history");
+    if (existing && existing.some(h => typeof h.id === 'number')) {
+      storage.set("history", []);
+      return [];
+    }
+    return existing || [];
+  });
+  const [watched, setWatched] = useState(() => {
+    // Clear old TMDB-based watched data
+    const existing = storage.get("watched");
+    if (existing && Object.keys(existing).some(k => k.match(/^(movie|tv)_\d+/))) {
+      storage.set("watched", {});
+      return {};
+    }
+    return existing || {};
+  });
   const [toast, setToast] = useState(null);
   const [updateBanner, setUpdateBanner] = useState(null);
   const [showUpdateModal, setShowUpdateModal] = useState(false);
-  // null | "checking" | { entries: object[] } | "none"
-  const [episodeCheckStatus, setEpisodeCheckStatus] = useState(null);
-  const episodeDismissTimerRef = useRef(null);
 
-  const [trending, setTrending] = useState([]);
-  const [trendingTV, setTrendingTV] = useState([]);
+  const [latestShows, setLatestShows] = useState([]);
+  const [popularShows, setPopularShows] = useState([]);
   const [loadingHome, setLoadingHome] = useState(false);
   const [offline, setOffline] = useState(() => !navigator.onLine);
 
@@ -111,202 +136,10 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Startup: new-episode notification check ──────────────────────────────
-  // Only runs once the API key has been loaded from secure storage (i.e. the
-  // app is fully started and past the setup screen). Shows an in-app status
-  // pill while checking, then either a result card or a brief "nothing new" message.
-  useEffect(() => {
-    if (!apiKeyLoaded) return;
-    const notifyPref = storage.get(STORAGE_KEYS.NOTIFY_NEW_EPISODE);
-    if (notifyPref === false || notifyPref === 0) return;
-
-    let cancelled = false;
-
-    async function checkNewEpisodes() {
-      // Small grace period so the UI has fully painted before we start
-      await new Promise((r) => setTimeout(r, 1200));
-      if (cancelled) return;
-
-      if (!apiKey || cancelled) return;
-
-      const tvSeries = Object.values(saved).filter(
-        (item) => item && item.media_type === "tv" && item.id,
-      );
-      if (!tvSeries.length) return;
-
-      // Only re-check entries older than 12 h
-      const cache = storage.get(STORAGE_KEYS.EPISODE_RELEASE_CACHE) || {};
-      const now = Date.now();
-      const CACHE_TTL = 12 * 60 * 60 * 1000;
-      const toCheck = tvSeries.filter(
-        (s) => !cache[s.id] || now - (cache[s.id].checkedAt || 0) > CACHE_TTL,
-      );
-
-      if (!toCheck.length) {
-        setEpisodeCheckStatus("none");
-        episodeDismissTimerRef.current = setTimeout(() => {
-          if (!cancelled) setEpisodeCheckStatus(null);
-        }, 2000);
-        return;
-      }
-
-      // Only show loading pill when there's actually something to check
-      setEpisodeCheckStatus("checking");
-
-      const BATCH = 3;
-      // Each entry: { title, season, id, seriesItem }
-      const newEpisodeEntries = [];
-
-      for (let i = 0; i < toCheck.length && !cancelled; i += BATCH) {
-        const batch = toCheck.slice(i, i + BATCH);
-        await Promise.all(
-          batch.map(async (series) => {
-            try {
-              const data = await tmdbFetch(`/tv/${series.id}`, apiKey);
-              if (cancelled) return;
-
-              const prev = cache[series.id] || {};
-              const lastEp = data.last_episode_to_air;
-              const lastDate = lastEp?.air_date || null;
-              const isFirstCheck = !prev.checkedAt;
-
-              // Parse air_date strings as local midnight to avoid UTC offset issues
-              const parseLocalDate = (d) => {
-                if (!d) return null;
-                const [y, m, day] = d.split("-").map(Number);
-                return new Date(y, m - 1, day);
-              };
-
-              const todayLocal = new Date();
-              todayLocal.setHours(0, 0, 0, 0);
-              const sevenDaysAgo = new Date(todayLocal);
-              sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
-              if (isFirstCheck) {
-                // First time: notify if latest episode aired in last 7 days
-                const lastParsed = parseLocalDate(lastDate);
-                if (lastParsed && lastParsed >= sevenDaysAgo) {
-                  newEpisodeEntries.push({
-                    title:
-                      series.title ||
-                      series.name ||
-                      data.name ||
-                      "Unknown series",
-                    season: lastEp?.season_number ?? null,
-                    id: series.id,
-                    seriesItem: series,
-                  });
-                }
-              } else {
-                // Subsequent checks: notify when last_episode_to_air changed
-                // (new episode aired) compared to what we cached.
-                // Migration: old cache entries only have nextEpDate, not lastEpDate.
-                // In that case treat as first check to avoid false positives.
-                const prevLastDate = prev.lastEpDate ?? null;
-                const isMigratingOldCache =
-                  prev.checkedAt && prevLastDate === null;
-
-                if (isMigratingOldCache) {
-                  // Just update the cache with lastEpDat
-                } else {
-                  const lastParsed = parseLocalDate(lastDate);
-                  const prevParsed = parseLocalDate(prevLastDate);
-
-                  const isNewEpisode =
-                    lastDate &&
-                    lastDate !== prevLastDate &&
-                    lastParsed &&
-                    lastParsed >= sevenDaysAgo &&
-                    (!prevParsed || lastParsed > prevParsed);
-
-                  if (isNewEpisode) {
-                    newEpisodeEntries.push({
-                      title:
-                        series.title ||
-                        series.name ||
-                        data.name ||
-                        "Unknown series",
-                      season: lastEp?.season_number ?? null,
-                      id: series.id,
-                      seriesItem: series,
-                    });
-                  }
-                }
-              }
-
-              cache[series.id] = {
-                lastEpDate: lastDate,
-                // keep nextEpDate for reference but don't use it for detection
-                nextEpDate: data.next_episode_to_air?.air_date || null,
-                checkedAt: now,
-              };
-            } catch {}
-          }),
-        );
-        if (i + BATCH < toCheck.length && !cancelled) {
-          await new Promise((r) => setTimeout(r, 400));
-        }
-      }
-
-      if (cancelled) return;
-
-      storage.set(STORAGE_KEYS.EPISODE_RELEASE_CACHE, cache);
-
-      if (newEpisodeEntries.length === 0) {
-        setEpisodeCheckStatus("none");
-        // Auto-dismiss after 2 s
-        episodeDismissTimerRef.current = setTimeout(() => {
-          if (!cancelled) setEpisodeCheckStatus(null);
-        }, 2000);
-        return;
-      }
-
-      // Show in-app result card
-      setEpisodeCheckStatus({ entries: newEpisodeEntries });
-
-      // Also fire OS notification
-      if (window.electron?.showNotification) {
-        const names = newEpisodeEntries.map((e) => e.title);
-        const body =
-          names.length === 1
-            ? `${names[0]} has a new episode.`
-            : `${names.slice(0, 3).join(", ")}${
-                names.length > 3 ? ` and ${names.length - 3} more` : ""
-              } have new episodes.`;
-        window.electron.showNotification({
-          title: "New episodes available",
-          body,
-          silent: false,
-        });
-      }
-    }
-
-    checkNewEpisodes().catch(() => {
-      if (!cancelled) setEpisodeCheckStatus(null);
-    });
-    return () => {
-      cancelled = true;
-      clearTimeout(episodeDismissTimerRef.current);
-    };
-  }, [apiKeyLoaded]);
-
   // ── Downloads state ──────────────────────────────────────────────────────
   const [downloads, setDownloads] = useState([]);
   const [highlightDownload, setHighlightDownload] = useState(null);
   const [closeConfirm, setCloseConfirm] = useState(null); // { count }
-
-  // ── Load API key from secure storage on startup ──
-  useEffect(() => {
-    let mounted = true;
-    secureStorage.get("apikey").then((val) => {
-      if (!mounted) return;
-      setApiKey(val || null);
-      setApiKeyLoaded(true);
-    });
-    return () => {
-      mounted = false;
-    };
-  }, []);
 
   // ── Detect platform for Windows titlebar ──────────────────────────────────
   useEffect(() => {
@@ -332,39 +165,6 @@ export default function App() {
     );
     return () => window.electron.offConfirmClose(handler);
   }, []);
-
-  // ── Register global API error handlers ──────────────────────────────────
-  // Fire on any tmdbFetch call that returns 401/403 or network failure
-  useEffect(() => {
-    setApiErrorHandlers(
-      () => setApiKeyStatus("invalid_token"), // 401 / 403
-      () => setApiKeyStatus("unreachable"), // network failure
-    );
-  }, []);
-
-  // ── Validate stored API key on startup ───────────────────────────────────
-  useEffect(() => {
-    if (!apiKey) {
-      setApiKeyStatus("ok");
-      return;
-    }
-    setApiKeyStatus("checking");
-    const controller = new AbortController();
-    fetch("https://api.themoviedb.org/3/configuration", {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: controller.signal,
-    })
-      .then((res) => {
-        if (res.status === 401 || res.status === 403)
-          setApiKeyStatus("invalid_token");
-        else setApiKeyStatus("ok");
-      })
-      .catch((err) => {
-        if (err.name === "AbortError") return;
-        setApiKeyStatus("unreachable");
-      });
-    return () => controller.abort();
-  }, [apiKey]);
 
   // Load persisted downloads on startup + immediately prune missing files
   useEffect(() => {
@@ -460,42 +260,40 @@ export default function App() {
     [downloads],
   );
 
-  // ── Trending, single shared fetch fn avoids code duplication ────────────
+  // ── Home page data fetch ────────────────────────────────────────────────
   // Results are cached in localStorage for 30 min to avoid redundant API calls
-  // and to keep trending data out of RAM between restarts.
-  const fetchTrending = useCallback(() => {
-    if (!apiKey) return;
-    const cached = storage.get("trendingCache");
+  const fetchHomeData = useCallback(() => {
+    const cached = storage.get("homeDataCache");
     const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
     if (cached && cached.ts && Date.now() - cached.ts < CACHE_TTL) {
-      setTrending(cached.movies || []);
-      setTrendingTV(cached.tv || []);
+      setLatestShows(cached.latest || []);
+      setPopularShows(cached.popular || []);
       return;
     }
     setLoadingHome(true);
     Promise.all([
-      tmdbFetch("/trending/movie/week", apiKey),
-      tmdbFetch("/trending/tv/week", apiKey),
+      fetchLatestShows(),
+      fetchPopularShows(),
     ])
-      .then(([m, t]) => {
-        const movies = m.results || [];
-        const tv = t.results || [];
-        setTrending(movies);
-        setTrendingTV(tv);
-        storage.set("trendingCache", { movies, tv, ts: Date.now() });
+      .then(([latestRes, popularRes]) => {
+        const latest = latestRes?.data || [];
+        const popular = popularRes?.data || [];
+        setLatestShows(latest);
+        setPopularShows(popular);
+        storage.set("homeDataCache", { latest, popular, ts: Date.now() });
       })
       .catch(() => {})
       .finally(() => setLoadingHome(false));
-  }, [apiKey]);
+  }, []);
 
   useEffect(() => {
-    fetchTrending();
-  }, [fetchTrending]);
+    fetchHomeData();
+  }, [fetchHomeData]);
 
   const retryHome = useCallback(() => {
     if (offline) return;
-    fetchTrending();
-  }, [offline, fetchTrending]);
+    fetchHomeData();
+  }, [offline, fetchHomeData]);
 
   // ── Sync librarySort when changed from Settings ───────────────────────────
   useEffect(() => {
