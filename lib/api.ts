@@ -24,7 +24,12 @@ async function fetchApi<T>(url: string): Promise<T | null> {
       console.error(`API Error: ${response.status}`);
       return null;
     }
-    return response.json();
+    const json = await response.json();
+    // Handle API responses that wrap data in a "data" property
+    if (json && typeof json === 'object' && 'data' in json && Array.isArray(json.data)) {
+      return json.data as T;
+    }
+    return json;
   } catch (error) {
     console.error("Fetch error:", error);
     return null;
